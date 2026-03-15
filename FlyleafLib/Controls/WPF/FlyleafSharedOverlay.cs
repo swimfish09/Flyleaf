@@ -1,5 +1,4 @@
-﻿using System;
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -61,6 +60,9 @@ public class FlyleafSharedOverlay : ContentControl
     public Window       Overlay         { get; private set; } = new Window() { WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, AllowsTransparency = true };
     public IntPtr       OverlayHandle   { get; private set; }
 
+    public double       DpiX            { get; private set; } = 1;
+    public double       DpiY            { get; private set; } = 1;
+
     static bool isDesignMode;
     Point zeroPoint = new(0, 0);
     static Rect rectRandom = new(1, 2, 3, 4);
@@ -92,6 +94,14 @@ public class FlyleafSharedOverlay : ContentControl
         OverlayHandle           = new WindowInteropHelper(Overlay).EnsureHandle();
         Owner.ContentRendered   += (o, e) => SetWindowPos(OverlayHandle, IntPtr.Zero, 0, 0, 0, 0, (UInt32)(SetWindowPosFlags.SWP_SHOWWINDOW | SetWindowPosFlags.SWP_NOSIZE | SetWindowPosFlags.SWP_NOMOVE));
 
+        Owner.DpiChanged        += Owner_DpiChanged;
+        var source = PresentationSource.FromVisual(Owner);
+        if (source != null)
+        {
+            DpiX = source.CompositionTarget.TransformToDevice.M11;
+            DpiY = source.CompositionTarget.TransformToDevice.M22;
+        }
+
         LayoutUpdated           += Host_LayoutUpdated;
         IsVisibleChanged        += Host_IsVisibleChanged;
         Overlay.MouseDown       += (o, e) => BringToFront();
@@ -104,12 +114,18 @@ public class FlyleafSharedOverlay : ContentControl
         Overlay.ShowInTaskbar   = false;
         Overlay.Owner           = Owner;
         SetParent(OverlayHandle, OwnerHandle);
-        SetWindowLong(OverlayHandle, (int)WindowLongFlags.GWL_STYLE, (nint) (WindowStyles.WS_MINIMIZEBOX | WindowStyles.WS_CLIPSIBLINGS | WindowStyles.WS_CLIPCHILDREN | WindowStyles.WS_VISIBLE | WindowStyles.WS_CHILD));
+        SetWindowLong(OverlayHandle, WindowStyles.WS_MINIMIZEBOX | WindowStyles.WS_CLIPSIBLINGS | WindowStyles.WS_CLIPCHILDREN | WindowStyles.WS_VISIBLE | WindowStyles.WS_CHILD);
         SetWindowPos(OverlayHandle, IntPtr.Zero, 0, 0, 0, 0, (uint)(SetWindowPosFlags.SWP_FRAMECHANGED | SetWindowPosFlags.SWP_NOACTIVATE | SetWindowPosFlags.SWP_NOSIZE | SetWindowPosFlags.SWP_NOZORDER | SetWindowPosFlags.SWP_NOOWNERZORDER));
 
         /*rectInitLast =*/ rectIntersectLast = rectRandom;
         Host_LayoutUpdated(null, null);
         Host_IsVisibleChanged(null, new());
+    }
+
+    private void Owner_DpiChanged(object sender, DpiChangedEventArgs e)
+    {
+        DpiX = e.NewDpi.DpiScaleX;
+        DpiY = e.NewDpi.DpiScaleY;
     }
     private void Host_DataContextChanged(object sender, DependencyPropertyChangedEventArgs e) => Overlay.DataContext = e.NewValue;
     private void Host_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)

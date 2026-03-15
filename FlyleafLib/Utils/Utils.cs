@@ -1,29 +1,28 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
-using System.IO;
 using System.IO.Compression;
-using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Windows;
 
 using Microsoft.Win32;
+using Vortice.Direct3D11;
 
 namespace FlyleafLib;
 
 public static partial class Utils
 {
+    public static readonly Rect         RectZero            = new(); // Rect.Empty has infinity values
+    public static readonly Point        PointEmpty          = new();
+    public static readonly CornerRadius CornerRadiusEmpty   = new();
+
+
     // VLC : https://github.com/videolan/vlc/blob/master/modules/gui/qt/dialogs/preferences/simple_preferences.cpp
     // Kodi: https://github.com/xbmc/xbmc/blob/master/xbmc/settings/AdvancedSettings.cpp
 
-    public static List<string> ExtensionsAudio = new()
-    {
+    public static readonly List<string> ExtensionsAudio =
+    [
         // VLC
           "3ga" , "669" , "a52" , "aac" , "ac3"
         , "adt" , "adts", "aif" , "aifc", "aiff"
@@ -35,27 +34,27 @@ public static partial class Utils
         , "rmi" , "snd" , "s3m" , "spx" , "tta"
         , "voc" , "vqf" , "w64" , "wav" , "wma"
         , "wv"  , "xa"  , "xm"
-    };
+    ];
 
-    public static List<string> ExtensionsPictures = new()
-    {
+    public static readonly List<string> ExtensionsPictures =
+    [
         "apng", "bmp", "gif", "jpg", "jpeg", "png", "ico", "tif", "tiff", "tga","jfif"
-    };
+    ];
 
-    public static List<string> ExtensionsSubtitlesText = new()
-    {
-        "ass", "ssa", "srt", "txt", "text", "vtt"
-    };
+    public static readonly List<string> ExtensionsSubtitlesText =
+    [
+        "ass", "ssa", "srt", "text", "vtt"
+    ];
 
-    public static List<string> ExtensionsSubtitlesBitmap = new()
-    {
+    public static readonly List<string> ExtensionsSubtitlesBitmap =
+    [
         "sub", "sup"
-    };
+    ];
 
-    public static List<string> ExtensionsSubtitles = [..ExtensionsSubtitlesText, ..ExtensionsSubtitlesBitmap];
+    public static readonly List<string> ExtensionsSubtitles = [..ExtensionsSubtitlesText, ..ExtensionsSubtitlesBitmap];
 
-    public static List<string> ExtensionsVideo = new()
-    {
+    public static readonly List<string> ExtensionsVideo =
+    [
         // VLC
           "3g2" , "3gp" , "3gp2", "3gpp", "amrec"
         , "amv" , "asf" , "avi" , "bik" , "divx"
@@ -72,7 +71,7 @@ public static partial class Utils
 
         // Additional
         , "dav"
-    };
+    ];
 
     private static int uniqueId;
     public static int GetUniqueId() { Interlocked.Increment(ref uniqueId); return uniqueId; }
@@ -95,7 +94,7 @@ public static partial class Utils
     /// Invokes the UI thread to execute the specified action
     /// </summary>
     /// <param name="action"></param>
-    public static void UIInvoke(Action action) => Application.Current.Dispatcher.Invoke(action);
+    public static void UIInvoke(Action action) => Application.Current.Dispatcher.Invoke(action, System.Windows.Threading.DispatcherPriority.DataBind);
 
     /// <summary>
     /// Invokes the UI thread if required to execute the specified action
@@ -103,10 +102,10 @@ public static partial class Utils
     /// <param name="action"></param>
     public static void UIInvokeIfRequired(Action action)
     {
-        if (Thread.CurrentThread.ManagedThreadId == Application.Current.Dispatcher.Thread.ManagedThreadId)
+        if (Environment.CurrentManagedThreadId == Application.Current.Dispatcher.Thread.ManagedThreadId)
             action();
         else
-            Application.Current.Dispatcher.Invoke(action);
+            Application.Current.Dispatcher.Invoke(action, System.Windows.Threading.DispatcherPriority.DataBind);
     }
 
     public static Thread STA(Action action)
@@ -129,8 +128,24 @@ public static partial class Utils
         int mod = num % align;
         return mod == 0 ? num : num + (align - mod);
     }
+
+    /// <summary>
+    /// Works only for power of 2
+    /// </summary>
+    /// <param name="num"></param>
+    /// <param name="align"></param>
+    /// <returns></returns>
+    public static int FFALIGN(int num, int align)
+        => (num + align - 1) & ~(align - 1);
+
     public static float Scale(float value, float inMin, float inMax, float outMin, float outMax)
         => ((value - inMin) * (outMax - outMin) / (inMax - inMin)) + outMin;
+
+    public static double SnapToInt(double value, double epsilon = 1e-6)
+    {
+        double nearest = Math.Round(value);
+        return Math.Abs(value - nearest) < epsilon ? nearest : value;
+    }
 
     /// <summary>
     /// Adds a windows firewall rule if not already exists for the specified program path
@@ -453,12 +468,20 @@ public static partial class Utils
             if (url == null || url.Length < 5)
                 return url;
 
-            if (url[..5].ToLower() == "file:")
+            if (url[..5].Equals("file:", StringComparison.OrdinalIgnoreCase))
                 return new Uri(url).LocalPath;
         }
         catch { }
 
         return url;
+    }
+    public static string LowerCaseFirstChar(string input)
+    {   // check null manually
+        Span<char> buffer = stackalloc char[input.Length];
+        input.AsSpan().CopyTo(buffer);
+        buffer[0] = char.ToLowerInvariant(buffer[0]);
+    
+        return new string(buffer);
     }
 
     /// <summary>
@@ -477,9 +500,7 @@ public static partial class Utils
             string targetPath = shortcut.TargetPath;
 
             if (string.IsNullOrEmpty(targetPath))
-            {
                 throw new InvalidOperationException("TargetPath is empty.");
-            }
 
             return targetPath;
         }
@@ -527,9 +548,8 @@ public static partial class Utils
             readable = i;
         }
         else
-        {
             return i.ToString("0 B"); // Byte
-        }
+
         // Divide by 1024 to get fractional value
         readable /= 1024;
         // Return formatted number with suffix
@@ -627,21 +647,33 @@ public static partial class Utils
     public static System.Windows.Media.Color VorticeToWPFColor(Vortice.Mathematics.Color sColor)
         => System.Windows.Media.Color.FromArgb(sColor.A, sColor.R, sColor.G, sColor.B);
     public static Vortice.Mathematics.Color WPFToVorticeColor(System.Windows.Media.Color wColor)
-        => new Vortice.Mathematics.Color(wColor.R, wColor.G, wColor.B, wColor.A);
+        => new(wColor.R, wColor.G, wColor.B, wColor.A);
+    public static VideoColor WPFToVideoColor(System.Windows.Media.Color wColor)
+    {
+        return new()
+        {
+            Rgba = new()
+            {
+                R = wColor.R / 255.0f,
+                G = wColor.G / 255.0f,
+                B = wColor.B / 255.0f,
+                A = wColor.A / 255.0f
+            }
+        };
+    }
+        
 
-    public static double SWFREQ_TO_TICKS =  10000000.0 / Stopwatch.Frequency;
+    public static readonly double SWFREQ_TO_TICKS = 10000000.0 / Stopwatch.Frequency;
     public static string ToHexadecimal(byte[] bytes)
     {
         StringBuilder hexBuilder = new();
         for (int i = 0; i < bytes.Length; i++)
-        {
             hexBuilder.Append(bytes[i].ToString("x2"));
-        }
+
         return hexBuilder.ToString();
     }
     public static int GCD(int a, int b) => b == 0 ? a : GCD(b, a % b);
-    public static string TicksToTime(long ticks) => new TimeSpan(ticks).ToString();
-    public static void Log(string msg) { try { Debug.WriteLine($"[{DateTime.Now:hh.mm.ss.fff}] {msg}"); } catch (Exception) { Debug.WriteLine($"[............] [MediaFramework] {msg}"); } }
+    public static void Log(string msg) { try { Debug.WriteLine($"{DateTime.Now:HH.mm.ss.fff} | {msg}"); } catch (Exception) { Debug.WriteLine($"[............] [MediaFramework] {msg}"); } }
 
     [GeneratedRegex("[^a-z0-9]extended", RegexOptions.IgnoreCase)]
     private static partial Regex RxExtended();
@@ -668,4 +700,146 @@ public static partial class Utils
     private static partial Regex RxSpaces();
     [GeneratedRegex(@"[^a-z0-9]$", RegexOptions.IgnoreCase)]
     private static partial Regex RxNonAlphaNumeric();
+
+    #region Temp Transfer (v4)
+    #nullable enable
+    static string metaSpaces = new(' ',"[Metadata] ".Length);
+    public static string GetDumpMetadata(Dictionary<string, string>? metadata, string? exclude = null)
+    {
+        if (metadata == null || metadata.Count == 0)
+            return "";
+
+        int maxLen = 0;
+        foreach(var item in metadata)
+            if (item.Key.Length > maxLen && item.Key != exclude)
+                maxLen = item.Key.Length;
+
+        string dump = "";
+        int i = 1;
+        foreach(var item in metadata)
+        {
+            if (item.Key == exclude)
+            {
+                i++;
+                continue;
+            }
+
+            if (i == metadata.Count)
+                dump += $"{item.Key.PadRight(maxLen)}: {item.Value}";
+            else
+                dump += $"{item.Key.PadRight(maxLen)}: {item.Value}\r\n\t{metaSpaces}";
+
+            i++;
+        }
+
+        if (dump == "")
+            return "";
+        
+        return $"\t[Metadata] {dump}";
+    }
+    public static string TicksToTime(long ticks)
+    {
+        if (ticks == NoTs)
+            return "-";
+
+        if (ticks == 0)
+            return "00:00:00.000";
+
+        return TsToTime(TimeSpan.FromTicks(ticks)); // TimeSpan.FromTicks(ticks).ToString("g");
+    }
+    public static string McsToTime(long micro)
+    {
+        if (micro == NoTs)
+            return "-";
+
+        if (micro == 0)
+            return "00:00:00.000";
+
+        return TsToTime(TimeSpan.FromMicroseconds(micro));
+    }
+    public static string TsToTime(TimeSpan ts)
+    {
+        if (ts.Ticks > 0)
+        {
+            if (ts.TotalDays < 1)
+                return ts.ToString(@"hh\:mm\:ss\.fff");
+            else
+                return ts.ToString(@"d\-hh\:mm\:ss\.fff");
+        }
+
+        if (ts.TotalDays > -1)
+            return ts.ToString(@"\-hh\:mm\:ss\.fff");
+        else
+            return ts.ToString(@"\-d\-hh\:mm\:ss\.fff");
+    }
+    public static string DoubleToTimeMini(double d) => d.ToString("#.000", CultureInfo.InvariantCulture);
+    public static string TicksToTimeMini(long ticks)
+    {
+        if (ticks == NoTs)
+            return "-";
+
+        if (ticks == 0)
+            return "00.000";
+
+        return TsToTimeMini(TimeSpan.FromTicks(ticks));
+    }
+    static string TsToTimeMini(TimeSpan ts)
+    {
+        if (ts.Ticks > 0)
+        {
+            if (ts.TotalMinutes < 1)
+                return ts.ToString(@"ss\.fff");
+            else if (ts.TotalHours < 1)
+                return ts.ToString(@"mm\:ss\.fff");
+            else if (ts.TotalDays < 1)
+                return ts.ToString(@"hh\:mm\:ss\.fff");
+            else
+                return ts.ToString(@"d\-hh\:mm\:ss\.fff");
+        }
+        
+        if (ts.TotalMinutes > -1)
+            return ts.ToString(@"\-ss\.fff");
+        else if (ts.TotalHours > -1)
+            return ts.ToString(@"\-mm\:ss\.fff");
+        else if (ts.TotalDays > -1)
+            return ts.ToString(@"\-hh\:mm\:ss\.fff");
+        else
+            return ts.ToString(@"\-d\-hh\:mm\:ss\.fff");
+    }
+    public static List<T> GetFlagsAsList<T>(T value) where T : Enum
+    {
+        List<T> values = [];
+
+        var enumValues = Enum.GetValuesAsUnderlyingType(typeof(T));
+        //var enumValues = Enum.GetValues(typeof(T)); // breaks AOT?
+
+        foreach(T flag in enumValues)
+            if (value.HasFlag(flag) && flag.ToString() != "None")
+                values.Add(flag);
+
+        return values;
+    }
+    public static string? GetFlagsAsString<T>(T value, string separator = " | ") where T : Enum
+    {
+        string? ret = null;
+        List<T> values = GetFlagsAsList(value);
+
+        if (values.Count == 0)
+            return ret;
+
+        for (int i = 0; i < values.Count - 1; i++)
+            ret += values[i] + separator; 
+
+        return ret + values[^1];
+    }
+    public unsafe static string GetFourCCString(uint fourcc)
+    {
+        byte* t1 = (byte*)av_mallocz(AV_FOURCC_MAX_STRING_SIZE);
+        av_fourcc_make_string(t1, fourcc);
+        string ret = BytePtrToStringUTF8(t1)!;
+        av_free(t1);
+        return ret;
+    }
+    #nullable disable
+    #endregion
 }

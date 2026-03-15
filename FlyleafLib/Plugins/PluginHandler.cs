@@ -1,6 +1,4 @@
-﻿using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.Linq;
+﻿using System.Linq;
 
 using FlyleafLib.MediaFramework.MediaPlaylist;
 using FlyleafLib.MediaFramework.MediaStream;
@@ -62,10 +60,10 @@ public class PluginHandler
     LogHandler Log;
     public PluginHandler(Config config, int uniqueId = -1)
     {
-        Config = config;
-        UniqueId= uniqueId == -1 ? Utils.GetUniqueId() : uniqueId;
-        Playlist = new Playlist(UniqueId);
-        Log = new LogHandler(("[#" + UniqueId + "]").PadRight(8, ' ') + " [PluginHandler ] ");
+        Config      = config;
+        UniqueId    = uniqueId == -1 ? GetUniqueId() : uniqueId;
+        Playlist    = new(UniqueId);
+        Log         = new(("[#" + UniqueId + "]").PadRight(8, ' ') + " [PluginHandler ] ");
         LoadPlugins();
     }
 
@@ -84,37 +82,37 @@ public class PluginHandler
     }
     private void LoadPlugins()
     {
-        Plugins = new Dictionary<string, PluginBase>();
+        Plugins = [];
 
         foreach (var type in Engine.Plugins.Types.Values)
         {
             try
             {
                 var plugin = CreatePluginInstance(type, this);
-                plugin.Log = new LogHandler(("[#" + UniqueId + "]").PadRight(8, ' ') + $" [{plugin.Name,-14}] ");
+                plugin.Log = new(("[#" + UniqueId + "]").PadRight(8, ' ') + $" [{plugin.Name,-14}] ");
                 Plugins.Add(plugin.Name, plugin);
-            } catch (Exception e) { Log.Error($"[Plugins] [Error] Failed to load plugin ... ({e.Message} {Utils.GetRecInnerException(e)}"); }
+            } catch (Exception e) { Log.Error($"[Plugins] [Error] Failed to load plugin ... ({e.Message} {GetRecInnerException(e)}"); }
             }
 
-        PluginsOpen                     = new Dictionary<string, IOpen>();
-        PluginsOpenSubtitles            = new Dictionary<string, IOpenSubtitles>();
-        PluginsScrapeItem               = new Dictionary<string, IScrapeItem>();
+        PluginsOpen                     = [];
+        PluginsOpenSubtitles            = [];
+        PluginsScrapeItem               = [];
 
-        PluginsSuggestItem              = new Dictionary<string, ISuggestPlaylistItem>();
+        PluginsSuggestItem              = [];
 
-        PluginsSuggestAudioStream       = new Dictionary<string, ISuggestAudioStream>();
-        PluginsSuggestVideoStream       = new Dictionary<string, ISuggestVideoStream>();
-        PluginsSuggestSubtitlesStream   = new Dictionary<string, ISuggestSubtitlesStream>();
-        PluginsSuggestSubtitles         = new Dictionary<string, ISuggestSubtitles>();
+        PluginsSuggestAudioStream       = [];
+        PluginsSuggestVideoStream       = [];
+        PluginsSuggestSubtitlesStream   = [];
+        PluginsSuggestSubtitles         = [];
 
-        PluginsSuggestExternalAudio     = new Dictionary<string, ISuggestExternalAudio>();
-        PluginsSuggestExternalVideo     = new Dictionary<string, ISuggestExternalVideo>();
+        PluginsSuggestExternalAudio     = [];
+        PluginsSuggestExternalVideo     = [];
         PluginsSuggestBestExternalSubtitles
-                                        = new Dictionary<string, ISuggestBestExternalSubtitles>();
+                                        = [];
 
-        PluginsSearchLocalSubtitles     = new Dictionary<string, ISearchLocalSubtitles>();
-        PluginsSearchOnlineSubtitles    = new Dictionary<string, ISearchOnlineSubtitles>();
-        PluginsDownloadSubtitles        = new Dictionary<string, IDownloadSubtitles>();
+        PluginsSearchLocalSubtitles     = [];
+        PluginsSearchOnlineSubtitles    = [];
+        PluginsDownloadSubtitles        = [];
 
         foreach (var plugin in Plugins.Values)
             LoadPluginInterfaces(plugin);

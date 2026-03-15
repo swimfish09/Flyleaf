@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
-using System.Threading.Tasks;
+﻿using System.ComponentModel;
 using System.Windows.Data;
 
 using SharpGen.Runtime;
@@ -31,17 +27,16 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
     /// List of Audio Capture Devices
     /// </summary>
     public ObservableCollection<AudioDevice>
-                        CapDevices          { get; set; } = new();
-
-    public void         RefreshCapDevices() => AudioDevice.RefreshDevices();
+                        CapDevices          { get; set; } = [];
 
     /// <summary>
     /// List of Audio Devices
     /// </summary>
     public ObservableCollection<AudioEndpoint>
-                        Devices             { get; private set; } = new();
+                        Devices             { get; private set; } = [];
 
     private readonly object lockDevices = new();
+    private readonly object lockCapDevices = new();
     #endregion
 
     IMMDeviceEnumerator deviceEnum;
@@ -49,7 +44,7 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
 
     public event PropertyChangedEventHandler PropertyChanged;
 
-    public AudioEngine()
+    public AudioEngine() // We consider from UI here
     {
         if (Engine.Config.DisableAudio)
         {
@@ -58,7 +53,23 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
         }
 
         BindingOperations.EnableCollectionSynchronization(Devices, lockDevices);
+        BindingOperations.EnableCollectionSynchronization(CapDevices, lockCapDevices);
         EnumerateDevices();
+    }
+
+    /// <summary>
+    /// Enumerates Audio Capture Devices which can be retrieved from <see cref="CapDevices"/>
+    /// </summary>
+    public void RefreshCapDevices()
+    {
+        lock (lockCapDevices)
+        {
+            Engine.Audio.CapDevices.Clear();
+
+            var devices = MediaFactory.MFEnumAudioDeviceSources();
+                foreach (var device in devices)
+                    try { Engine.Audio.CapDevices.Add(new(device.FriendlyName, device.SymbolicLink)); } catch(Exception) { }
+        }
     }
 
     private void EnumerateDevices()
@@ -85,7 +96,7 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
             CurrentDevice.Id    = defaultDevice.Id;
             CurrentDevice.Name  = defaultDevice.FriendlyName;
 
-            if (Logger.CanInfo)
+            if (CanInfo)
             {
                 string dump = "";
                 foreach (var device in deviceEnum.EnumAudioEndpoints(DataFlow.Render, DeviceStates.Active))
@@ -106,12 +117,12 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
     }
     private void RefreshDevices()
     {
-        lock (locker)
+        UIInvokeIfRequired(() => // UI Required?
         {
-            Utils.UIInvokeIfRequired(() => // UI Required?
+            lock (locker)
             {
-                List<AudioEndpoint> curs     = new();
-                List<AudioEndpoint> removed  = new();
+                List<AudioEndpoint> curs     = [];
+                List<AudioEndpoint> removed  = [];
 
                 lock (lockDevices)
                 {
@@ -158,7 +169,7 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
                 {
                     CurrentDevice.Id    = defaultDevice.Id;
                     CurrentDevice.Name  = defaultDevice.FriendlyName;
-                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CurrentDevice)));
+                    PropertyChanged?.Invoke(this, new(nameof(CurrentDevice)));
                 }
 
                 // Fall back to DefaultDevice *Non-UI thread otherwise will freeze (not sure where and why) during xaudio.Dispose()
@@ -172,10 +183,10 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
                                     player.Audio.Device = DefaultDevice;
                         }
                     });
-            });
-        }
+            }
+        });
     }
-
+    
     public void OnDeviceStateChanged(string pwstrDeviceId, int newState) => RefreshDevices();
     public void OnDeviceAdded(string pwstrDeviceId) => RefreshDevices();
     public void OnDeviceRemoved(string pwstrDeviceId) => RefreshDevices();
