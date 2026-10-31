@@ -5,7 +5,7 @@ using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Windows;
-
+using System.Windows.Threading;
 using Microsoft.Win32;
 using Vortice.Direct3D11;
 
@@ -75,25 +75,21 @@ public static partial class Utils
     private static int uniqueId;
     public static int GetUniqueId() { Interlocked.Increment(ref uniqueId); return uniqueId; }
 
+    internal static Dispatcher uiDispatcher;
+
     /// <summary>
     /// Begin invokes the UI thread if required to execute the specified action
     /// </summary>
     /// <param name="action"></param>
     public static void UI(Action action)
-    {
-#if DEBUG
-        if (Application.Current == null)
-            return;
-#endif
-
-        Application.Current.Dispatcher.BeginInvoke(action, System.Windows.Threading.DispatcherPriority.DataBind);
-    }
+        => uiDispatcher.BeginInvoke(action, DispatcherPriority.DataBind);
 
     /// <summary>
     /// Invokes the UI thread to execute the specified action
     /// </summary>
     /// <param name="action"></param>
-    public static void UIInvoke(Action action) => Application.Current.Dispatcher.Invoke(action, System.Windows.Threading.DispatcherPriority.DataBind);
+    public static void UIInvoke(Action action)
+        => uiDispatcher.Invoke(action, DispatcherPriority.DataBind);
 
     /// <summary>
     /// Invokes the UI thread if required to execute the specified action
@@ -101,10 +97,10 @@ public static partial class Utils
     /// <param name="action"></param>
     public static void UIInvokeIfRequired(Action action)
     {
-        if (Environment.CurrentManagedThreadId == Application.Current.Dispatcher.Thread.ManagedThreadId)
+        if (Environment.CurrentManagedThreadId == uiDispatcher.Thread.ManagedThreadId)
             action();
         else
-            Application.Current.Dispatcher.Invoke(action, System.Windows.Threading.DispatcherPriority.DataBind);
+            uiDispatcher.Invoke(action, DispatcherPriority.DataBind);
     }
 
     public static Thread STA(Action action)
@@ -128,15 +124,6 @@ public static partial class Utils
         return mod == 0 ? num : num + (align - mod);
     }
 
-    /// <summary>
-    /// Works only for power of 2
-    /// </summary>
-    /// <param name="num"></param>
-    /// <param name="align"></param>
-    /// <returns></returns>
-    public static int FFALIGN(int num, int align)
-        => (num + align - 1) & ~(align - 1);
-
     public static float Scale(float value, float inMin, float inMax, float outMin, float outMax)
         => ((value - inMin) * (outMax - outMin) / (inMax - inMin)) + outMin;
 
@@ -144,6 +131,18 @@ public static partial class Utils
     {
         double nearest = Math.Round(value);
         return Math.Abs(value - nearest) < epsilon ? nearest : value;
+    }
+
+    public static double SmoothStep(double edge0, double edge1, double x)
+    {
+        x = Math.Clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+        return x * x * (3.0 - 2.0 * x);
+    }
+
+    public static float SmoothStep(float edge0, float edge1, float x)
+    {
+        x = Math.Clamp((x - edge0) / (edge1 - edge0), 0, 1);
+        return x * x * (3.0f - 2.0f * x);
     }
 
     /// <summary>

@@ -1,0 +1,1075 @@
+﻿using System.Numerics;
+using System.Runtime.InteropServices;
+
+using Vortice.Direct3D11;
+
+using FlyleafLib.MediaFramework.MediaFrame;
+
+namespace FlyleafLib.MediaFramework.MediaRenderer;
+
+public unsafe partial class Renderer
+{
+    /// <summary>
+    /// Whether to use Dolby Vision reconstruction or the compatible base layer
+    /// </summary>
+    public bool DoviPreferBaseLayer;
+
+    /// <summary>
+    /// Whether to use Dolby L1 metadata or Flyleaf's histogram for tone mapping
+    /// </summary>
+    public bool DoviUseHDRDetect;
+    bool doviNeedsHDRDetect;
+    bool? doviIsCM4;
+
+    const int doviVectors             = 190; // 187 reconstruction + 3 L2 trim vectors
+    const int doviTrimInfo            = 187;
+    const int doviTrimPrimary         = 188;
+    const int doviTrimSecondary       = 189;
+    const int doviComponentVectors    = 59;
+    const int doviComponentBase       = 10;
+    const int doviMmrVectors          = 48;
+    const float doviPivotSentinel     = 1e9f;
+
+    // Dovi[0]      : sampleScale, identityReshape, 0, 0
+    // Dovi[1..3]   : affine YCC -> nonlinear RGB rows
+    // Dovi[4..6]   : linear DOVI RGB -> BT.2020 rows, BT.2020 luma coefficients in .w
+    // Dovi[7..9]   : linear DOVI RGB -> BT.709 rows
+    // Dovi[10..186]: three reshape components, 59 float4s each
+    // Dovi[187]    : L2 present (0/2), authored reference peak, 0, 0
+    // Dovi[188]    : slope, offset, power, chroma weight
+    // Dovi[189]    : saturation gain, tone detail factor, 0, 0
+    static BufferDescription doviDesc = new()
+    {
+        Usage          = ResourceUsage.Default,
+        BindFlags      = BindFlags.ConstantBuffer,
+        CPUAccessFlags = CpuAccessFlags.None,
+        ByteWidth      = doviVectors * 16
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DoviBufferType
+    {
+        public fixed float Data[doviVectors * 4];
+    }
+
+    internal readonly record struct DoviTrimSnapshot(
+        int Level, float TargetNits,
+        float Slope, float Offset, float Power,
+        float ChromaWeight, float SaturationGain, float MsWeight);
+
+    internal sealed class DoviFrameData
+    {
+        public DoviBufferType Buffer;
+        internal DoviTrimSnapshot Trim;
+    }
+
+    DoviFrameData doviPreparedData; // Prepare-side cache for repeated RPUs.
+    (float Min, float Avg, float Max)? doviL1Nits;
+
+    DoviFrameData doviAppliedData;  // Render-side cache
+    bool doviAppliedEmpty;
+
+    // FFmpeg reattaches fresh side data every frame; compare actual metadata.
+    bool                    doviSourceCached;
+    byte                    doviCachedBlBitDepth;
+    byte                    doviCachedCoefLog2Denom;
+    AVDOVIReshapingCurve    doviCachedCurve0, doviCachedCurve1, doviCachedCurve2;
+    AVDOVIColorMetadata     doviCachedColor;
+
+    static ReadOnlySpan<float> DoviHpeLmsTo2020 =>
+    [
+         3.06441879f, -2.16597676f,  0.10155818f,
+        -0.65612108f,  1.78554118f, -0.12943749f,
+         0.01736321f, -0.04725154f,  1.03004253f
+    ];
+
+    static ReadOnlySpan<float> Dovi2020To709 =>
+    [
+         1.6605f, -0.5876f, -0.0728f,
+        -0.1246f,  1.1329f, -0.0083f,
+        -0.0182f, -0.1006f,  1.1187f
+    ];
+
+    static ReadOnlySpan<float> DoviLuma2020 => [0.2627f, 0.6780f, 0.0593f];
+
+    bool FLDoviSupported()
+    {
+        if (scfg == null || !scfg.DoviRpuPresent || !scfg.DoviBlPresent || (DoviPreferBaseLayer && scfg.HDRFormat != HDRFormat.None))
+            return false;
+        
+        return scfg.DoviProfile switch
+        {
+            // Unknown profile; DOVI metadata confirmed on decoded frame
+            -1 => true,
+
+            // Profile 5 has no standards-compatible BL and therefore requires
+            // Dolby reconstruction for correct playback. Compatibility ID must be 0.
+            5 => scfg.DoviCompatibility == 0,
+
+            // Profile 7 is HDR10/UHD-BD compatible. Older configuration records
+            // may omit the compatibility nibble (0), while current ones use 6.
+            7 => scfg.DoviCompatibility is 0 or 6,
+
+            // Profile 8 is single-layer and the compatibility ID defines the BL:
+            // 0 none/proprietary, 1 HDR10, 2 SDR, 4 HLG, 6 UHD-BD/HDR10.
+            8 => scfg.DoviCompatibility is 0 or 1 or 2 or 4 or 6,
+
+            // Profile 10 is single-layer 10-bit AV1. Public Dolby variants are
+            // 10.0 (native/proprietary), 10.1 (HDR10) and 10.4 (HLG). FFmpeg
+            // can also signal compatibility 2 for a BT.709/SDR-compatible BL,
+            // and the parsed RPU uses the same AVDOVIMetadata reconstruction.
+            10 => scfg.DoviCompatibility is 0 or 1 or 2 or 4,
+
+            _ => false
+        };
+    }
+
+    void FLDoviReset(AVFrame* frame)
+    {
+        doviL1Nits          = null;
+        doviPreparedData    = null;
+        doviAppliedData     = null;
+        doviAppliedEmpty    = false;
+        doviSourceCached    = false;
+        doviCachedColor     = default;
+        doviCachedCurve0    = default;
+        doviCachedCurve1    = default;
+        doviCachedCurve2    = default;
+        doviIsCM4           = FLDoviIsCM4(frame);
+        doviNeedsHDRDetect  = DoviUseHDRDetect || doviIsCM4 != false;
+    }
+
+    static bool? FLDoviIsCM4(AVFrame* frame)
+    {
+        if (frame == null)
+            return null;
+
+        var side = av_frame_side_data_get(frame->side_data, frame->nb_side_data, AVFrameSideDataType.DOVIMetadata);
+        if (side == null || side->data == null)
+            return null;
+
+        var dovi = (AVDOVIMetadata*)side->data;
+        for (int i = 0; i < dovi->num_ext_blocks; i++)
+        {
+            var dm = (AVDOVIDmData*)((byte*)dovi + dovi->ext_block_offset +
+                dovi->ext_block_size * (nuint)i);
+            if (dm->level is 3 or 8 or 254)
+                return true;
+        }
+
+        return false;
+    }
+
+    (DoviFrameData, (float Min, float Avg, float Max)?) FLDoviPrepare(AVFrame* frame)
+    {
+        var side = av_frame_side_data_get(frame->side_data, frame->nb_side_data, AVFrameSideDataType.DOVIMetadata);
+
+        if (side == null || side->data == null)
+            return (null, null);
+
+        var dovi    = (AVDOVIMetadata*)side->data;
+        var header  = (AVDOVIRpuDataHeader*)((byte*)dovi + dovi->header_offset);
+        var mapping = (AVDOVIDataMapping*)  ((byte*)dovi + dovi->mapping_offset);
+        var color   = (AVDOVIColorMetadata*)((byte*)dovi + dovi->color_offset);
+
+        // Guard malformed coefficient ranges
+        if (header->coef_log2_denom < 13 || header->coef_log2_denom > 32)
+            return (null, null);
+
+        // Apply L2 only for CM 2.9; CM 4.x uses HDRDetect until L8 is supported.
+        var trim = doviIsCM4 == false ? FLDoviSelectTrim(dovi) : default;
+
+        // Reuse cached reconstruction state when only per-frame trim values change.
+        if (doviPreparedData != null && DoviSourceEquals(header, mapping, color))
+        {
+            if (doviPreparedData.Trim != trim)
+            {
+                // Keep queued frames immutable when only trims change.
+                DoviBufferType nextBuffer = doviPreparedData.Buffer;
+                DoviWriteTrim(ref nextBuffer, trim);
+                doviPreparedData = new() { Buffer = nextBuffer, Trim = trim };
+            }
+            return (doviPreparedData, FLDoviL1Nits(dovi));
+        }
+        
+        // Guard malformed BL depth
+        if (header->bl_bit_depth < 8 || header->bl_bit_depth > 16)
+            return (null, null);
+
+        int sampleBits = scfg.PixelComp0Depth > 8 ? 16 : 8;
+        if (header->bl_bit_depth > sampleBits)
+            return (null, null);
+
+        uint sampleMax = (1u << sampleBits) - 1u;
+        uint blMax     = (1u << header->bl_bit_depth) - 1u;
+        int shift      = sampleBits - header->bl_bit_depth;
+
+        float sampleScale = sampleMax / (blMax * (float)(1u << shift));
+        float coefScale   = MathF.ScaleB(1.0f, -header->coef_log2_denom);
+        float pivotScale  = 1.0f / blMax;
+
+        if (!float.IsFinite(sampleScale) || !float.IsFinite(coefScale))
+            return (null, null);
+
+        DoviBufferType buffer = default;
+
+        // All temporary matrix work stays on the stack. RPU metadata may be present
+        // on every frame, so avoid creating managed 3x3 arrays in this hot path.
+        Span<float> ycc        = stackalloc float[9];
+        Span<float> offset     = stackalloc float[3];
+        Span<float> rgbToLms   = stackalloc float[9];
+        Span<float> doviTo2020 = stackalloc float[9];
+        Span<float> doviTo709  = stackalloc float[9];
+        Span<float> luma       = stackalloc float[3];
+
+        for (int r = 0; r < 3; r++)
+        {
+            if (!DoviTryFloat(color->ycc_to_rgb_offset[r], out offset[r]))
+                return (null, null);
+
+            for (int c = 0; c < 3; c++)
+            {
+                if (!DoviTryFloat(color->ycc_to_rgb_matrix[r * 3 + c], out ycc[r * 3 + c]) ||
+                    !DoviTryFloat(color->rgb_to_lms_matrix[r * 3 + c], out rgbToLms[r * 3 + c]))
+                    return (null, null);
+            }
+        }
+
+        // RPU custom YCC -> nonlinear RGB. Fold the neutral offsets into row .w.
+        for (int r = 0; r < 3; r++)
+        {
+            int i = r * 3;
+            float bias = -(ycc[i] * offset[0] + ycc[i + 1] * offset[1] + ycc[i + 2] * offset[2]);
+            DoviSet(ref buffer, 1 + r, new(ycc[i], ycc[i + 1], ycc[i + 2], bias));
+        }
+
+        // Fold RGB->LMS into BT.2020 first, then derive the BT.709 output matrix.
+        // Keep both: BT.2020 is the source colour volume for gamut mapping, while
+        // BT.709 is the renderer/output representation after tone mapping.
+        DoviMul3x3(DoviHpeLmsTo2020, rgbToLms, doviTo2020);
+        DoviMul3x3(Dovi2020To709, doviTo2020, doviTo709);
+        DoviMulRow3x3(DoviLuma2020, doviTo2020, luma);
+
+        for (int r = 0; r < 3; r++)
+        {
+            int i = r * 3;
+
+            Vector4 row2020 = new(doviTo2020[i], doviTo2020[i + 1], doviTo2020[i + 2], luma[r]);
+            Vector4 row709  = new(doviTo709[i],  doviTo709[i + 1],  doviTo709[i + 2],  0);
+
+            if (!DoviFinite(row2020) || !DoviFinite(row709))
+                return (null, null);
+
+            DoviSet(ref buffer, 4 + r, row2020);
+            DoviSet(ref buffer, 7 + r, row709);
+        }
+
+        // Seven possible internal pivots. Allocate once for the whole method, not
+        // inside the component loop (avoids CA2014 and repeated stack growth).
+        Span<float> pivots = stackalloc float[7];
+        bool identityReshape = true;
+
+        for (int component = 0; component < 3; component++)
+        {
+            ref var curve = ref mapping->curves[component];
+            int numPivots = curve.num_pivots;
+
+            // FFmpeg contract: [2, 9], strictly sorted ascending.
+            if (numPivots < 2 || numPivots > 9)
+                return (null, null);
+
+            ushort previous = curve.pivots[0];
+            if (previous > blMax)
+                return (null, null);
+
+            for (int i = 1; i < numPivots; i++)
+            {
+                ushort current = curve.pivots[i];
+                if (current <= previous || current > blMax)
+                    return (null, null);
+                previous = current;
+            }
+
+            int componentBase = doviComponentBase + component * doviComponentVectors;
+            float lo = curve.pivots[0] * pivotScale;
+            float hi = curve.pivots[numPivots - 1] * pivotScale;
+
+            DoviSet(ref buffer, componentBase, new(lo, hi, numPivots, 0));
+
+            pivots.Fill(doviPivotSentinel);
+            for (int i = 1; i < numPivots - 1; i++)
+                pivots[i - 1] = curve.pivots[i] * pivotScale;
+
+            DoviSet(ref buffer, componentBase + 1,
+                new(pivots[0], pivots[1], pivots[2], pivots[3]));
+            DoviSet(ref buffer, componentBase + 2,
+                new(pivots[4], pivots[5], pivots[6], doviPivotSentinel));
+
+            // Common Profile 7 mappings are exact identity transforms. Signal
+            // this to HLSL so it can bypass all pivot/polynomial work per pixel.
+            identityReshape &=
+                numPivots == 2 &&
+                curve.pivots[0] == 0 &&
+                curve.pivots[1] == blMax &&
+                curve.mapping_idc[0] == AVDOVIMappingMethod.Polynomial &&
+                curve.poly_order[0] == 1 &&
+                curve.poly_coef[0][0] == 0 &&
+                curve.poly_coef[0][1] == (1L << header->coef_log2_denom);
+
+            int mmrIndex = 0;
+            int pieces   = numPivots - 1;
+
+            for (int p = 0; p < pieces; p++)
+            {
+                switch (curve.mapping_idc[p])
+                {
+                    case AVDOVIMappingMethod.Polynomial:
+                    {
+                        int order = curve.poly_order[p];
+                        if (order < 1 || order > 2)
+                            return (null, null);
+
+                        float c0 = curve.poly_coef[p][0] * coefScale;
+                        float c1 = curve.poly_coef[p][1] * coefScale;
+                        float c2 = order == 2 ? curve.poly_coef[p][2] * coefScale : 0;
+
+                        if (!float.IsFinite(c0) || !float.IsFinite(c1) || !float.IsFinite(c2))
+                            return (null, null);
+
+                        DoviSet(ref buffer, componentBase + 3 + p, new(c0, c1, c2, 0));
+                        break;
+                    }
+
+                    case AVDOVIMappingMethod.Mmr:
+                    {
+                        int order = curve.mmr_order[p];
+                        if (order < 1 || order > 3)
+                            return (null, null);
+
+                        int vectors = order * 2;
+                        if (mmrIndex + vectors > doviMmrVectors)
+                            return (null, null);
+
+                        float constant = curve.mmr_constant[p] * coefScale;
+                        if (!float.IsFinite(constant))
+                            return (null, null);
+
+                        DoviSet(ref buffer, componentBase + 3 + p,
+                            new(constant, mmrIndex, 0, order));
+
+                        for (int o = 0; o < order; o++)
+                        {
+                            int mmrBase = componentBase + 11 + mmrIndex;
+
+                            Vector4 a = new(
+                                curve.mmr_coef[p][o][0] * coefScale,
+                                curve.mmr_coef[p][o][1] * coefScale,
+                                curve.mmr_coef[p][o][2] * coefScale,
+                                0);
+
+                            Vector4 b = new(
+                                curve.mmr_coef[p][o][3] * coefScale,
+                                curve.mmr_coef[p][o][4] * coefScale,
+                                curve.mmr_coef[p][o][5] * coefScale,
+                                curve.mmr_coef[p][o][6] * coefScale);
+
+                            if (!DoviFinite(a) || !DoviFinite(b))
+                                return (null, null);
+
+                            DoviSet(ref buffer, mmrBase,     a);
+                            DoviSet(ref buffer, mmrBase + 1, b);
+
+                            mmrIndex += 2;
+                        }
+                        break;
+                    }
+
+                    default:
+                        return (null, null);
+                }
+            }
+        }
+
+        DoviSet(ref buffer, 0, new(sampleScale, identityReshape ? 1.0f : 0.0f, 0, 0));
+        DoviWriteTrim(ref buffer, trim);
+
+        DoviCacheSource(header, mapping, color);
+        doviPreparedData = new() { Buffer = buffer, Trim = trim };
+        return (doviPreparedData, FLDoviL1Nits(dovi));
+    }
+
+    (float Min, float Avg, float Max)? FLDoviL1Nits(AVDOVIMetadata* dovi)
+    {
+        if (doviNeedsHDRDetect)
+            return null;
+
+        for (int i = 0; i < dovi->num_ext_blocks; i++)
+        {
+            var dm = (AVDOVIDmData*)((byte*)dovi + dovi->ext_block_offset +
+                dovi->ext_block_size * (nuint)i);
+            if (dm->level != 1)
+                continue;
+
+            var l1 = dm->union0.l1;
+            return (PQToNitsDovi(l1.min_pq),
+                    PQToNitsDovi(l1.avg_pq),
+                    PQToNitsDovi(l1.max_pq));
+        }
+
+        return null;
+    }
+
+    static float DoviTrimSigned(ushort code) => code / 4096f - 0.5f;
+    static float DoviTrimUnit(ushort code)   => code / 4096f + 0.5f;
+
+    static float DoviTrimLerp(float a, float b, float t) => a + (b - a) * t;
+
+    static DoviTrimSnapshot DoviInterpolateTrim(DoviTrimSnapshot low, DoviTrimSnapshot high, float targetNits, float t)
+        => new(
+            2, targetNits,
+            DoviTrimLerp(low.Slope, high.Slope, t),
+            DoviTrimLerp(low.Offset, high.Offset, t),
+            DoviTrimLerp(low.Power, high.Power, t),
+            DoviTrimLerp(low.ChromaWeight, high.ChromaWeight, t),
+            DoviTrimLerp(low.SaturationGain, high.SaturationGain, t),
+            DoviTrimLerp(low.MsWeight, high.MsWeight, t));
+
+    DoviTrimSnapshot FLDoviSelectTrim(AVDOVIMetadata* dovi)
+    {
+        float targetNits = hdrData.TargetPeakNits;
+        if (!float.IsFinite(targetNits) || targetNits <= 0)
+            return default;
+
+        // Interpolate in PQ space, not linear nits. Use the closest endpoint
+        // without extrapolating if the target falls outside authored references.
+        float targetPQ = NitsToPQ(targetNits);
+        float lowPQ = -1f, highPQ = 2f;
+        float exactDistance = float.MaxValue;
+        DoviTrimSnapshot low = default, high = default, exact = default;
+
+        for (int i = 0; i < dovi->num_ext_blocks; i++)
+        {
+            var dm = (AVDOVIDmData*)((byte*)dovi + dovi->ext_block_offset +
+                dovi->ext_block_size * (nuint)i);
+            if (dm->level != 2)
+                continue;
+
+            var l2 = dm->union0.l2;
+            if (l2.target_max_pq is 0 or > 4095)
+                continue;
+
+            float pq = l2.target_max_pq / 4095f;
+            bool takeLow = pq <= targetPQ && pq > lowPQ;
+            bool takeHigh = pq >= targetPQ && pq < highPQ;
+            float distance = MathF.Abs(pq - targetPQ);
+            bool takeExact = distance <= 0.5f / 4095f && distance < exactDistance;
+            if (!takeLow && !takeHigh && !takeExact)
+                continue;
+
+            float referenceNits = PQToNitsDovi(l2.target_max_pq);
+            int ms = l2.ms_weight;
+            // The 100-nit Rec.709 reference does not use Tone Detail.
+            float msFactor = MathF.Abs(referenceNits - 100f) <= 2f || ms is < 0 or > 4095
+                ? 0f : ms / 4096f;
+
+            var trim = new DoviTrimSnapshot(
+                2, referenceNits,
+                DoviTrimUnit(l2.trim_slope),
+                DoviTrimSigned(l2.trim_offset),
+                DoviTrimUnit(l2.trim_power),
+                DoviTrimSigned(l2.trim_chroma_weight),
+                DoviTrimSigned(l2.trim_saturation_gain),
+                msFactor);
+
+            if (takeLow)   { lowPQ = pq; low = trim; }
+            if (takeHigh)  { highPQ = pq; high = trim; }
+            if (takeExact) { exactDistance = distance; exact = trim; }
+        }
+
+        if (exact.Level != 0)
+            return hdrData.NativeOutput != 0 ? exact : exact with { MsWeight = 0f };
+
+        if (low.Level == 0 && high.Level == 0)
+            return default;
+
+        DoviTrimSnapshot selected;
+        if (low.Level == 0)
+            selected = high;
+        else if (high.Level == 0)
+            selected = low;
+        else if (highPQ - lowPQ <= 1f / 4095f)
+            selected = low;
+        else
+        {
+            float t = Math.Clamp((targetPQ - lowPQ) / (highPQ - lowPQ), 0f, 1f);
+            selected = DoviInterpolateTrim(low, high, targetNits, t);
+        }
+
+        // This renderer doesn't apply spatial Tone Detail on SDR output.
+        return hdrData.NativeOutput != 0 ? selected : selected with { MsWeight = 0f };
+    }
+
+    static void DoviWriteTrim(ref DoviBufferType buffer, DoviTrimSnapshot trim)
+    {
+        DoviSet(ref buffer, doviTrimInfo,
+            new(trim.Level, trim.TargetNits, 0, 0));
+        DoviSet(ref buffer, doviTrimPrimary,
+            new(trim.Slope, trim.Offset, trim.Power, trim.ChromaWeight));
+        DoviSet(ref buffer, doviTrimSecondary,
+            new(trim.SaturationGain, trim.MsWeight, 0, 0));
+    }
+
+    void FLDoviApply(VideoFrame frame)
+    {
+        var data = frame.Dovi;
+
+        if (data != null)
+        {
+            if (doviNeedsHDRDetect)
+                FLHDRDetect();
+            else if (frame.DoviL1Nits is { } l1 && doviL1Nits != l1)
+            {
+                doviL1Nits = l1;
+
+                hdrData.SourceMinNits   = l1.Min;
+                hdrData.SourcePeakNits  = l1.Max;
+                float splinePeakNits    = MathF.Max(l1.Max, hdrData.TargetPeakNits);
+
+                hdrData.Spline = GetSplineParams(
+                    sourceMinNits:  l1.Min,
+                    sourceAvgNits:  l1.Avg,
+                    sourcePeakNits: splinePeakNits,
+                    targetMinNits:  hdrData.TargetMinNits,
+                    targetPeakNits: hdrData.TargetPeakNits);
+
+                context.UpdateSubresource(hdrData, hdrBuffer);
+            }
+            else if (doviL1Nits == null)
+            {   // RPU without L1 (HDR Detect fallback)
+                doviNeedsHDRDetect = true;
+                FLHDRDetect();
+            }
+
+            if (ReferenceEquals(data, doviAppliedData))
+                return;
+
+            context.UpdateSubresource(data.Buffer, doviBuffer);
+            doviAppliedData  = data;
+            doviAppliedEmpty = false;
+            return;
+        }
+
+        // A DOVI shader should normally always have RPU metadata. Clear once when
+        // metadata is missing/invalid so an older frame's RPU is never reused.
+        if (doviAppliedEmpty)
+            return;
+
+        DoviBufferType empty = default;
+        context.UpdateSubresource(empty, doviBuffer);
+        doviAppliedData  = null;
+        doviAppliedEmpty = true;
+    }
+
+    static bool DoviTryFloat(AVRational value, out float result)
+    {
+        if (value.Den == 0)
+        {
+            result = 0;
+            return false;
+        }
+
+        result = (float)value.Num / value.Den;
+        return float.IsFinite(result);
+    }
+
+    static bool DoviFinite(Vector4 value)
+        => float.IsFinite(value.X) && float.IsFinite(value.Y) &&
+           float.IsFinite(value.Z) && float.IsFinite(value.W);
+
+    static void DoviSet(ref DoviBufferType buffer, int index, Vector4 value)
+    {
+        fixed (float* p = buffer.Data)
+            ((Vector4*)p)[index] = value;
+    }
+
+    bool DoviSourceEquals(AVDOVIRpuDataHeader* header, AVDOVIDataMapping* mapping, AVDOVIColorMetadata* color)
+    {
+        if (!doviSourceCached ||
+            header->bl_bit_depth    != doviCachedBlBitDepth ||
+            header->coef_log2_denom != doviCachedCoefLog2Denom)
+            return false;
+
+        ref var curve0 = ref mapping->curves[0];
+        ref var curve1 = ref mapping->curves[1];
+        ref var curve2 = ref mapping->curves[2];
+
+        if (!DoviCurveEquals(ref curve0, ref doviCachedCurve0) ||
+            !DoviCurveEquals(ref curve1, ref doviCachedCurve1) ||
+            !DoviCurveEquals(ref curve2, ref doviCachedCurve2))
+            return false;
+
+        for (int i = 0; i < 9; i++)
+            if (!DoviRationalEquals(color->ycc_to_rgb_matrix[i], doviCachedColor.ycc_to_rgb_matrix[i]) ||
+                !DoviRationalEquals(color->rgb_to_lms_matrix[i], doviCachedColor.rgb_to_lms_matrix[i]))
+                return false;
+
+        for (int i = 0; i < 3; i++)
+            if (!DoviRationalEquals(color->ycc_to_rgb_offset[i], doviCachedColor.ycc_to_rgb_offset[i]))
+                return false;
+
+        return true;
+    }
+
+    void DoviCacheSource(AVDOVIRpuDataHeader* header, AVDOVIDataMapping* mapping, AVDOVIColorMetadata* color)
+    {
+        doviCachedBlBitDepth     = header->bl_bit_depth;
+        doviCachedCoefLog2Denom  = header->coef_log2_denom;
+        doviCachedCurve0         = mapping->curves[0];
+        doviCachedCurve1         = mapping->curves[1];
+        doviCachedCurve2         = mapping->curves[2];
+        doviCachedColor          = *color;
+        doviSourceCached         = true;
+    }
+
+    static bool DoviCurveEquals(ref AVDOVIReshapingCurve a, ref AVDOVIReshapingCurve b)
+    {
+        var ba = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref a, 1));
+        var bb = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref b, 1));
+        return ba.SequenceEqual(bb);
+    }
+
+    static bool DoviRationalEquals(AVRational a, AVRational b)
+        => a.Num == b.Num && a.Den == b.Den;
+
+    static void DoviMul3x3(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> dst)
+    {
+        for (int r = 0; r < 3; r++)
+        {
+            int ri = r * 3;
+            for (int c = 0; c < 3; c++)
+            {
+                dst[ri + c] =
+                    a[ri]     * b[c] +
+                    a[ri + 1] * b[3 + c] +
+                    a[ri + 2] * b[6 + c];
+            }
+        }
+    }
+
+    static void DoviMulRow3x3(ReadOnlySpan<float> row, ReadOnlySpan<float> matrix, Span<float> dst)
+    {
+        dst[0] = row[0] * matrix[0] + row[1] * matrix[3] + row[2] * matrix[6];
+        dst[1] = row[0] * matrix[1] + row[1] * matrix[4] + row[2] * matrix[7];
+        dst[2] = row[0] * matrix[2] + row[1] * matrix[5] + row[2] * matrix[8];
+    }
+
+    string FLDoviDump(AVFrame* frame)
+    {
+        if (frame == null)
+            return null;
+
+        var side = av_frame_side_data_get(frame->side_data, frame->nb_side_data, AVFrameSideDataType.DOVIMetadata);
+
+        if (side == null || side->data == null)
+            return null;
+
+        var dovi    = (AVDOVIMetadata*)side->data;
+        var header  = (AVDOVIRpuDataHeader*)((byte*)dovi + dovi->header_offset);
+        var mapping = (AVDOVIDataMapping*)  ((byte*)dovi + dovi->mapping_offset);
+        var color   = (AVDOVIColorMetadata*)((byte*)dovi + dovi->color_offset);
+
+        static double DoviDumpRational(AVRational value) => value.Den == 0 ? double.NaN : (double)value.Num / value.Den;
+
+        StringBuilder sb = new();
+        
+        sb.AppendLine("");
+        sb.AppendLine("============================================================");
+        sb.AppendLine("DOLBY VISION METADATA");
+        sb.AppendLine("============================================================");
+
+        sb.AppendLine("");
+        sb.AppendLine("[AVDOVIMetadata]");
+        sb.AppendLine($"  header_offset  = {dovi->header_offset}");
+        sb.AppendLine($"  mapping_offset = {dovi->mapping_offset}");
+        sb.AppendLine($"  color_offset   = {dovi->color_offset}");
+        sb.AppendLine($"  ext_mapping_idc_0_4              = {header->ext_mapping_idc_0_4}");
+        sb.AppendLine($"  ext_mapping_idc_5_7              = {header->ext_mapping_idc_5_7}");
+
+        sb.AppendLine("");
+        sb.AppendLine("[MAPPING HEADER]");
+        sb.AppendLine($"  vdr_rpu_id                       = {mapping->vdr_rpu_id}");
+        sb.AppendLine($"  mapping_color_space              = {mapping->mapping_color_space}");
+        sb.AppendLine($"  mapping_chroma_format_idc        = {mapping->mapping_chroma_format_idc}");
+        sb.AppendLine($"  nlq_method_idc                   = {mapping->nlq_method_idc}");
+        sb.AppendLine($"  num_x_partitions                 = {mapping->num_x_partitions}");
+        sb.AppendLine($"  num_y_partitions                 = {mapping->num_y_partitions}");
+
+        sb.AppendLine("");
+        sb.AppendLine("[RPU HEADER]");
+
+        sb.AppendLine($"  rpu_type                        = {header->rpu_type}");
+        sb.AppendLine($"  rpu_format                      = {header->rpu_format}");
+        sb.AppendLine($"  vdr_rpu_profile                 = {header->vdr_rpu_profile}");
+        sb.AppendLine($"  vdr_rpu_level                   = {header->vdr_rpu_level}");
+
+        sb.AppendLine($"  chroma_resampling_explicit_filter_flag = {header->chroma_resampling_explicit_filter_flag}");
+
+        sb.AppendLine($"  coef_data_type                  = {header->coef_data_type}");
+        sb.AppendLine($"  coef_log2_denom                 = {header->coef_log2_denom}");
+
+        sb.AppendLine($"  vdr_rpu_normalized_idc          = {header->vdr_rpu_normalized_idc}");
+        sb.AppendLine($"  bl_video_full_range_flag        = {header->bl_video_full_range_flag}");
+
+        sb.AppendLine($"  bl_bit_depth                    = {header->bl_bit_depth}");
+        sb.AppendLine($"  el_bit_depth                    = {header->el_bit_depth}");
+        sb.AppendLine($"  vdr_bit_depth                   = {header->vdr_bit_depth}");
+
+        sb.AppendLine($"  spatial_resampling_filter_flag  = {header->spatial_resampling_filter_flag}");
+        sb.AppendLine($"  el_spatial_resampling_filter_flag = {header->el_spatial_resampling_filter_flag}");
+
+        sb.AppendLine($"  disable_residual_flag           = {header->disable_residual_flag}");
+
+        sb.AppendLine("");
+        sb.AppendLine("[COLOR METADATA]");
+
+        sb.AppendLine("  ycc_to_rgb_matrix:");
+        for (int r = 0; r < 3; r++)
+        {
+            sb.Append("    ");
+
+            for (int c = 0; c < 3; c++)
+            {
+                AVRational v = color->ycc_to_rgb_matrix[r * 3 + c];
+
+                sb.Append(
+                    $"{v.Num}/{v.Den} ({DoviDumpRational(v):F10}) ");
+            }
+
+            sb.AppendLine("");
+        }
+
+        sb.AppendLine("  ycc_to_rgb_offset:");
+        for (int i = 0; i < 3; i++)
+        {
+            AVRational v = color->ycc_to_rgb_offset[i];
+
+            sb.AppendLine(
+                $"    [{i}] = {v.Num}/{v.Den} ({DoviDumpRational(v):F10})");
+        }
+
+        sb.AppendLine("  rgb_to_lms_matrix:");
+        for (int r = 0; r < 3; r++)
+        {
+            sb.Append("    ");
+
+            for (int c = 0; c < 3; c++)
+            {
+                AVRational v = color->rgb_to_lms_matrix[r * 3 + c];
+
+                sb.Append(
+                    $"{v.Num}/{v.Den} ({DoviDumpRational(v):F10}) ");
+            }
+
+            sb.AppendLine("");
+        }
+
+        sb.AppendLine("");
+        sb.AppendLine("[COLOR SIGNAL METADATA]");
+        sb.AppendLine($"  dm_metadata_id          = {color->dm_metadata_id}");
+        sb.AppendLine($"  scene_refresh_flag      = {color->scene_refresh_flag}");
+        sb.AppendLine($"  signal_eotf             = {color->signal_eotf}");
+        sb.AppendLine($"  signal_eotf_param0      = {color->signal_eotf_param0}");
+        sb.AppendLine($"  signal_eotf_param1      = {color->signal_eotf_param1}");
+        sb.AppendLine($"  signal_eotf_param2      = {color->signal_eotf_param2}");
+        sb.AppendLine($"  signal_bit_depth        = {color->signal_bit_depth}");
+        sb.AppendLine($"  signal_color_space      = {color->signal_color_space}");
+        sb.AppendLine($"  signal_chroma_format    = {color->signal_chroma_format}");
+        sb.AppendLine($"  signal_full_range_flag  = {color->signal_full_range_flag}");
+        sb.AppendLine($"  source_min_pq           = {color->source_min_pq}");
+        sb.AppendLine($"  source_max_pq           = {color->source_max_pq}");
+        sb.AppendLine($"  source_diagonal         = {color->source_diagonal}");
+        sb.AppendLine("");
+        sb.AppendLine("[RESHAPING MAPPING]");
+
+        for (int component = 0; component < 3; component++)
+        {
+            ref var curve = ref mapping->curves[component];
+
+            sb.AppendLine("");
+            sb.AppendLine($"  COMPONENT {component}");
+            sb.AppendLine($"    num_pivots = {curve.num_pivots}");
+
+            sb.Append("    pivots = ");
+
+            for (int i = 0; i < curve.num_pivots; i++)
+            {
+                if (i != 0)
+                    sb.Append(", ");
+
+                sb.Append(curve.pivots[i]);
+            }
+
+            sb.AppendLine("");
+
+            int pieces = curve.num_pivots - 1;
+
+            for (int p = 0; p < pieces; p++)
+            {
+                sb.AppendLine("");
+                sb.AppendLine($"    PIECE {p}");
+                sb.AppendLine($"      mapping_idc = {curve.mapping_idc[p]}");
+
+                switch (curve.mapping_idc[p])
+                {
+                    case AVDOVIMappingMethod.Polynomial:
+                    {
+                        int order = curve.poly_order[p];
+
+                        sb.AppendLine($"      poly_order = {order}");
+
+                        for (int i = 0; i <= order; i++)
+                        {
+                            long raw = curve.poly_coef[p][i];
+
+                            double scaled =
+                                raw * Math.ScaleB(1.0, -header->coef_log2_denom);
+
+                            sb.AppendLine(
+                                $"      poly_coef[{i}] = {raw} -> {scaled:F12}");
+                        }
+
+                        break;
+                    }
+
+                    case AVDOVIMappingMethod.Mmr:
+                    {
+                        int order = curve.mmr_order[p];
+
+                        sb.AppendLine($"      mmr_order    = {order}");
+
+                        {
+                            long raw = curve.mmr_constant[p];
+
+                            double scaled =
+                                raw * Math.ScaleB(1.0, -header->coef_log2_denom);
+
+                            sb.AppendLine(
+                                $"      mmr_constant = {raw} -> {scaled:F12}");
+                        }
+
+                        for (int o = 0; o < order; o++)
+                        {
+                            sb.AppendLine($"      MMR ORDER {o + 1}:");
+
+                            for (int i = 0; i < 7; i++)
+                            {
+                                long raw = curve.mmr_coef[p][o][i];
+
+                                double scaled =
+                                    raw * Math.ScaleB(1.0, -header->coef_log2_denom);
+
+                                sb.AppendLine(
+                                    $"        coef[{i}] = {raw} -> {scaled:F12}");
+                            }
+                        }
+
+                        break;
+                    }
+
+                    default:
+                        sb.AppendLine("      *** UNKNOWN MAPPING TYPE ***");
+                        break;
+                }
+            }
+        }
+
+        sb.AppendLine("");
+        sb.AppendLine("[DM EXTENSION BLOCKS]");
+        sb.AppendLine($"  ext_block_offset = {dovi->ext_block_offset}");
+        sb.AppendLine($"  ext_block_size   = {dovi->ext_block_size}");
+        sb.AppendLine($"  num_ext_blocks   = {dovi->num_ext_blocks}");
+        for (int i = 0; i < dovi->num_ext_blocks; i++)
+        {
+            var dm = (AVDOVIDmData*)((byte*)dovi +dovi->ext_block_offset +dovi->ext_block_size * (nuint)i);
+
+            sb.AppendLine("");
+            sb.AppendLine($"  [{i}] LEVEL {dm->level}");
+
+            switch (dm->level)
+            {
+                case 1:
+                {   // Min / Mid / Max brightness
+                    var l = dm->union0.l1;
+
+                    sb.AppendLine($"    min_pq  = {l.min_pq}");
+                    sb.AppendLine($"    max_pq  = {l.max_pq}");
+                    sb.AppendLine($"    avg_pq  = {l.avg_pq}");
+                    break;
+                }
+
+                case 2:
+                {   // CM 2.9 creative trims per target display
+                    var l = dm->union0.l2;
+
+                    sb.AppendLine($"    target_max_pq        = {l.target_max_pq}");
+                    sb.AppendLine($"    trim_slope           = {l.trim_slope}");
+                    sb.AppendLine($"    trim_offset          = {l.trim_offset}");
+                    sb.AppendLine($"    trim_power           = {l.trim_power}");
+                    sb.AppendLine($"    trim_chroma_weight   = {l.trim_chroma_weight}");
+                    sb.AppendLine($"    trim_saturation_gain = {l.trim_saturation_gain}");
+                    sb.AppendLine($"    ms_weight            = {l.ms_weight}");
+                    break;
+                }
+
+                case 3:
+                {   // Corrections to L1 statistics
+                    var l = dm->union0.l3;
+
+                    sb.AppendLine($"    min_pq_offset = {l.min_pq_offset}");
+                    sb.AppendLine($"    max_pq_offset = {l.max_pq_offset}");
+                    sb.AppendLine($"    avg_pq_offset = {l.avg_pq_offset}");
+                    break;
+                }
+
+                case 4:
+                {   // Anchor PQ / power metadata
+                    var l = dm->union0.l4;
+
+                    sb.AppendLine($"    anchor_pq    = {l.anchor_pq}");
+                    sb.AppendLine($"    anchor_power = {l.anchor_power}");
+                    break;
+                }
+
+                case 5:
+                {   // Active picture area / black-bar boundaries
+                    var l = dm->union0.l5;
+
+                    sb.AppendLine($"    left_offset   = {l.left_offset}");
+                    sb.AppendLine($"    right_offset  = {l.right_offset}");
+                    sb.AppendLine($"    top_offset    = {l.top_offset}");
+                    sb.AppendLine($"    bottom_offset = {l.bottom_offset}");
+                    break;
+                }
+
+                case 6:
+                {   // Static HDR10 mastering and content metadata
+                    var l = dm->union0.l6;
+
+                    sb.AppendLine($"    max_luminance = {l.max_luminance}");
+                    sb.AppendLine($"    min_luminance = {l.min_luminance}");
+                    sb.AppendLine($"    max_cll       = {l.max_cll}");
+                    sb.AppendLine($"    max_fall      = {l.max_fall}");
+                    break;
+                }
+
+                case 8:
+                {   // CM 4.0 extended creative trims
+                    var l = dm->union0.l8;
+
+                    sb.AppendLine($"    target_display_index = {l.target_display_index}");
+                    sb.AppendLine($"    trim_slope           = {l.trim_slope}");
+                    sb.AppendLine($"    trim_offset          = {l.trim_offset}");
+                    sb.AppendLine($"    trim_power           = {l.trim_power}");
+                    sb.AppendLine($"    trim_chroma_weight   = {l.trim_chroma_weight}");
+                    sb.AppendLine($"    trim_saturation_gain = {l.trim_saturation_gain}");
+                    sb.AppendLine($"    ms_weight            = {l.ms_weight}");
+                    sb.AppendLine($"    target_mid_contrast  = {l.target_mid_contrast}");
+                    sb.AppendLine($"    clip_trim            = {l.clip_trim}");
+
+                    sb.Append("    saturation_vector    = ");
+                    for (int j = 0; j < 6; j++)
+                    {
+                        if (j != 0)
+                            sb.Append(", ");
+
+                        sb.Append(l.saturation_vector_field[j]);
+                    }
+                    sb.AppendLine();
+
+                    sb.Append("    hue_vector           = ");
+                    for (int j = 0; j < 6; j++)
+                    {
+                        if (j != 0)
+                            sb.Append(", ");
+
+                        sb.Append(l.hue_vector_field[j]);
+                    }
+                    sb.AppendLine();
+                    break;
+                }
+
+                case 9:
+                {   // Source mastering-display primaries
+                    var l = dm->union0.l9;
+
+                    sb.AppendLine($"    source_primary_index = {l.source_primary_index}");
+
+                    // source_display_primaries is AVColorPrimariesDesc.
+                    // Dump separately if useful.
+                    break;
+                }
+
+                case 10:
+                {   // Target-display characteristics
+                    var l = dm->union0.l10;
+
+                    sb.AppendLine($"    target_display_index = {l.target_display_index}");
+                    sb.AppendLine($"    target_max_pq        = {l.target_max_pq}");
+                    sb.AppendLine($"    target_min_pq        = {l.target_min_pq}");
+                    sb.AppendLine($"    target_primary_index = {l.target_primary_index}");
+
+                    // target_display_primaries is AVColorPrimariesDesc.
+                    // Dump separately if useful.
+                    break;
+                }
+
+                case 11:
+                {   // Content type / white-point intent (APO)
+                    var l = dm->union0.l11;
+
+                    sb.AppendLine($"    content_type        = {l.content_type}");
+                    sb.AppendLine($"    whitepoint          = {l.whitepoint}");
+                    sb.AppendLine($"    reference_mode_flag = {l.reference_mode_flag}");
+                    break;
+                }
+
+                case 254:
+                {   // Content-mapping version information
+                    var l = dm->union0.l254;
+
+                    sb.AppendLine($"    dm_mode          = {l.dm_mode}");
+                    sb.AppendLine($"    dm_version_index = {l.dm_version_index}");
+                    break;
+                }
+
+                case 255:
+                {   // Debug metadata
+                    var l = dm->union0.l255;
+
+                    sb.AppendLine($"    dm_run_mode    = {l.dm_run_mode}");
+                    sb.AppendLine($"    dm_run_version = {l.dm_run_version}");
+
+                    sb.Append("    dm_debug       = ");
+                    for (int j = 0; j < 4; j++)
+                    {
+                        if (j != 0)
+                            sb.Append(", ");
+
+                        sb.Append(l.dm_debug[j]);
+                    }
+                    sb.AppendLine();
+                    break;
+                }
+
+                default:
+                    sb.AppendLine("    (unknown / unsupported level)");
+                    break;
+            }
+		}
+	
+	    sb.AppendLine("");
+	    sb.AppendLine("============================================================");
+
+        return sb.ToString();
+	}
+}

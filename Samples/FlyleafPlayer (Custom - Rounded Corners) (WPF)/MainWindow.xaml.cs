@@ -37,7 +37,7 @@ namespace FlyleafPlayer__Custom___Rounded_Corners___WPF_
                 #if DEBUG
                 LogOutput       = ":debug",
                 LogLevel        = LogLevel.Debug,
-                FFmpegLogLevel  = Flyleaf.FFmpeg.LogLevel.Warn,
+                FFmpegLogLevel  = Flyleaf.FFmpeg.LogLevel.Warning,
                 #endif
 
                 PluginsPath     = ":Plugins",

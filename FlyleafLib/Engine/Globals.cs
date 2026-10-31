@@ -8,6 +8,7 @@ global using System.Threading;
 global using System.Threading.Tasks;
 
 global using Flyleaf.FFmpeg;
+global using FF = Flyleaf.FFmpeg;
 
 global using static Flyleaf.FFmpeg.Raw;
 global using static FlyleafLib.Logger;
@@ -40,9 +41,9 @@ public enum InputType
 public enum HDRtoSDRMethod // Must match pixel shader
 {
     None,
-    Aces,
-    Hable,
-    Reinhard
+    HLG,
+    PQ,
+    PQSpline
 }
 
 public enum DeInterlace // Must match with VideoFrameFormat
@@ -78,9 +79,9 @@ public enum Cropping
 public enum ColorSpace
 {
     None,
-    Bt601,
-    Bt709,
-    Bt2020
+    BT601,
+    BT709,
+    BT2020
 }
 public enum ColorRange
 {
@@ -97,9 +98,7 @@ public enum ColorType
 public enum HDRFormat
 {
     None,
-    DolbyVision,
-    HDR,
-    HDRPlus,
+    HDR10,
     HLG
 }
 public enum UIRefreshType
@@ -138,6 +137,7 @@ public class GPUOutput
     public bool             IsAttached      { get; internal set; }
     public ModeRotation     Rotation        { get; internal set; }
     public float            MaxLuminance    { get; internal set; }
+    public float            MinLuminance    { get; internal set; }
     //public int              RefreshRate     { get; internal set; } // Currently not used
 
     public override string ToString()
@@ -160,7 +160,7 @@ public class GPUAdapter
 
     internal IDXGIAdapter   dxgiAdapter;
 
-    public List<GPUOutput>  GetGPUOutputs()    => Engine.Video.GetGPUOutputs(dxgiAdapter);
+    public List<GPUOutput>  GetGPUOutputs() => VideoEngine.GetGPUOutputs(dxgiAdapter);
 
     public override string  ToString()
         => (Vendor + " " + Description).PadRight(40) + $"[ID: {Id,-6}, LUID: {Luid,-6}, DVM: {GetBytesReadable(VideoMemory),-8}, DSM: {GetBytesReadable(SystemMemory),-8}, SSM: {GetBytesReadable(SharedMemory)}]";

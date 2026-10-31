@@ -69,6 +69,7 @@ public unsafe partial class Renderer
     };
     RenderTargetViewDescription[]   d3rtvDesc   = new RenderTargetViewDescription[2];
     FillPlanesDelegate              D3FillPlanesStage;
+    VideoProcessorRotation          d3Rotation  = VideoProcessorRotation.Identity;
 
     bool                            d3CanPresent; // Don't render / present during out of bounds viewport
 
@@ -133,12 +134,12 @@ public unsafe partial class Renderer
         FFmpegSetup();
     }
 
-    bool D3Config()
+    bool D3Config(AVFrame* frame)
     {
         if (VideoDecoder.VideoAccelerated)
             D3HWConfig();
         else
-            D3SWConfig();
+            D3SWConfig(frame);
 
         D3Deinterlace(); // TBR: maybe request instead?
 
@@ -153,7 +154,7 @@ public unsafe partial class Renderer
             d3ColorIn.Nominal_Range = 1;
         }
 
-        d3ColorIn.YCbCr_Matrix = scfg.ColorSpace != ColorSpace.Bt601? 1u : 0u;
+        d3ColorIn.YCbCr_Matrix = scfg.ColorSpace != ColorSpace.BT601 ? 1u : 0u;
 
         vc.VideoProcessorSetStreamColorSpace(vp, 0, d3ColorIn);
 
@@ -169,15 +170,15 @@ public unsafe partial class Renderer
 
         return true;
     }
-    bool D3SWConfig()
+    bool D3SWConfig(AVFrame* frame)
     {
-        if (scfg.ColorType == ColorType.RGB && scfg.PixelFormat != AVPixelFormat.Rgba)
+        if (scfg.ColorType == ColorType.RGB && scfg.PixelFormat != AVPixelFormat.RGBA)
         {   // TBR: re-ordered RGB offsets?* extra pass*
-            SwsConfig();
+            SwsConfig(frame);
             canFL = false;
         }
         else
-            FLSwsConfig();
+            FLSwsConfig(frame);
 
         context.VSSetShader(vsSimple);
         vpivd.Texture2D.ArraySlice = 0;
@@ -322,10 +323,10 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
         if (!ucfg.SuperResolution)
             DisableSuperRes();
         else
-        {
-            if (scfg.PixelComp0Depth <= 8 && // Seems it crashes with 10-bit?
-               (((rotation ==  0 || rotation == 180) && view.Width > VisibleWidth  && view.Height > VisibleHeight) ||
-                ((rotation == 90 || rotation == 270) && view.Width > VisibleHeight && view.Height > VisibleWidth)))
+        {   // Seems it crashes with 10-bit | RGB/GRAY?
+            if (scfg.PixelComp0Depth == 8 && scfg.ColorType == ColorType.YUV &&
+               (((rotation ==  0 || rotation == 180) && view.Width > VisibleWidth  || view.Height > VisibleHeight) ||
+                ((rotation == 90 || rotation == 270) && view.Width > VisibleHeight || view.Height > VisibleWidth)))
                 EnableSuperRes();
             else
                 DisableSuperRes();
@@ -357,7 +358,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
         int     srcLeft,    srcTop,     srcRight,   srcBottom;
         double  scaleX,     scaleY,     scaleXRot,  scaleYRot;
 
-        if (rotation == 0)
+        if (d3Rotation == VideoProcessorRotation.Identity)
         {
             cropLeft    = view.X < 0 ? (int)(-view.X) : 0;
             cropTop     = view.Y < 0 ? (int)(-view.Y) : 0;
@@ -370,7 +371,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
             srcRight    = srcLeft + (int)(dstWidth  * scaleX);
             srcBottom   = srcTop  + (int)(dstHeight * scaleY);
         }
-        else if (rotation == 180)
+        else if (d3Rotation == VideoProcessorRotation.Rotation180)
         {
             cropRight   = right  > width  ? right  - width  : 0;
             cropBottom  = bottom > height ? bottom - height : 0;
@@ -383,7 +384,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
             srcRight    = srcLeft + (int)(dstWidth  * scaleX);
             srcBottom   = srcTop  + (int)(dstHeight * scaleY);
         }
-        else if (rotation == 90)
+        else if (d3Rotation == VideoProcessorRotation.Rotation90)
         {
             cropTop     = view.Y < 0 ? (int)(-view.Y) : 0;
             cropRight   = right > width ? right - width : 0;
@@ -396,7 +397,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
             srcRight    = srcLeft + (int)(dstHeight * scaleXRot);
             srcBottom   = srcTop  + (int)(dstWidth  * scaleYRot);
         }
-        else if (rotation == 270)
+        else if (d3Rotation == VideoProcessorRotation.Rotation270)
         {
             cropLeft    = view.X < 0 ? (int)(-view.X) : 0;
             cropBottom  = bottom > height ? bottom - height : 0;
@@ -431,11 +432,12 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
     void D3SetRotationFlip()
     {
         SetRotation();
-        vc.VideoProcessorSetStreamRotation(vp, 0, true, ToD3Rotation());
+        d3Rotation = ToD3Rotation();
+        vc.VideoProcessorSetStreamRotation(vp, 0, true, d3Rotation);
 
         VideoProcessorRotation ToD3Rotation()
         {
-            if (rotation < 45 || rotation == 360)
+            if (rotation < 45 || rotation > 315)
                 return VideoProcessorRotation.Identity;
 
             if (rotation < 135)
@@ -455,7 +457,6 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
 
         SetVisibleSizeAndRatioHelper();
 
-        vpRequests &= ~VPRequestType.Crop;
         vpRequests |=  VPRequestType.Viewport;
     }
     void D3Deinterlace()
@@ -476,6 +477,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
     static readonly SuperResNvidia  SuperResEnabledNvidia   = new(true);
     static readonly SuperResNvidia  SuperResDisabledNvidia  = new(false);
     static readonly Guid            GUID_SUPERRES_NVIDIA    = Guid.Parse("d43ce1b3-1f4b-48ac-baee-c3c25375e6f7");
+    bool superResNvidiaAvailable;
 
     [StructLayout(LayoutKind.Sequential)]
     struct SuperResIntel
@@ -496,14 +498,19 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
         if (SuperResolution)
             return;
 
-        SuperResolution = true;
-        RaiseUI(nameof(SuperResolution));
+        if (gpuAdapter.Vendor == GPUVendor.Nvidia)
+        {
+            if (!superResNvidiaAvailable)
+                return;
 
-        if (GPUAdapter.Vendor == GPUVendor.Nvidia)
             fixed (SuperResNvidia* ptr = &SuperResEnabledNvidia)
                 vc.VideoProcessorSetStreamExtension(vp, 0, GUID_SUPERRES_NVIDIA, (uint)sizeof(SuperResNvidia), (nint)ptr);
-        else if (GPUAdapter.Vendor == GPUVendor.Intel)
+        }
+        else if (gpuAdapter.Vendor == GPUVendor.Intel)
             UpdateSuperResIntel(true);
+
+        SuperResolution = true;
+        RaiseUI(nameof(SuperResolution));
     }
 
     void DisableSuperRes()
@@ -559,6 +566,9 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
 
             if (vpRequests.HasFlag(VPRequestType.BackColor))
                 SetBackColor();
+
+            if (vpRequests.HasFlag(VPRequestType.UpdateSwapChain))
+                UpdateHDRSwapchain();
 
             if (vpRequests.HasFlag(VPRequestType.RotationFlip))
                 D3SetRotationFlip();
@@ -639,19 +649,19 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
         dump += $"MaxStreamStates           {vpCaps.MaxStreamStates}\r\n";
 
         dump += $"\n[Video Processor Device Caps]\r\n";
-        foreach (VideoProcessorDeviceCaps cap in Enum.GetValues<VideoProcessorDeviceCaps>())
+        foreach (var cap in Enum.GetValues<VideoProcessorDeviceCaps>())
             dump += $"{cap,-25} {((vpCaps.DeviceCaps & cap) != 0 ? "yes" : "no")}\r\n";
 
         dump += $"\n[Video Processor Feature Caps]\r\n";
-        foreach (VideoProcessorFeatureCaps cap in Enum.GetValues<VideoProcessorFeatureCaps>())
+        foreach (var cap in Enum.GetValues<VideoProcessorFeatureCaps>())
             dump += $"{cap,-25} {((vpCaps.FeatureCaps & cap) != 0 ? "yes" : "no")}\r\n";
 
         dump += $"\n[Video Processor Stereo Caps]\r\n";
-        foreach (VideoProcessorStereoCaps cap in Enum.GetValues<VideoProcessorStereoCaps>())
+        foreach (var cap in Enum.GetValues<VideoProcessorStereoCaps>())
             dump += $"{cap,-25} {((vpCaps.StereoCaps & cap) != 0 ? "yes" : "no")}\r\n";
 
         dump += $"\n[Video Processor Input Format Caps]\r\n";
-        foreach (VideoProcessorFormatCaps cap in Enum.GetValues<VideoProcessorFormatCaps>())
+        foreach (var cap in Enum.GetValues<VideoProcessorFormatCaps>())
             dump += $"{cap,-25} {((vpCaps.InputFormatCaps & cap) != 0 ? "yes" : "no")}\r\n";
 
         dump += $"\n[Video Processor Filter Caps]\r\n";
@@ -666,14 +676,13 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
                 dump += $"{filter,-25} no\r\n";
 
         dump += $"\n[Video Processor Auto Stream Caps]\r\n";
-        foreach (VideoProcessorAutoStreamCaps cap in Enum.GetValues<VideoProcessorAutoStreamCaps>())
+        foreach (var cap in Enum.GetValues<VideoProcessorAutoStreamCaps>())
             dump += $"{cap,-25} {((vpCaps.AutoStreamCaps & cap) != 0 ? "yes" : "no")}\r\n";
 
-        VideoProcessorRateConversionCaps rcCap = new();
         for (uint i = 0; i < vpCaps.RateConversionCapsCount; i++)
         {
-            ve.GetVideoProcessorRateConversionCaps(i, out rcCap);
-            VideoProcessorProcessorCaps pCaps = (VideoProcessorProcessorCaps) rcCap.ProcessorCaps;
+            ve.GetVideoProcessorRateConversionCaps(i, out var rcCap);
+            var pCaps = (VideoProcessorProcessorCaps) rcCap.ProcessorCaps;
 
             dump += $"\n[Video Processor Rate Conversion Caps #{i}]\r\n";
 
@@ -683,7 +692,7 @@ color = float4(Texture2.Sample(Sampler, input.Texture).r, Texture3.Sample(Sample
                 dump += $"\t{field.Name,-35} {field.GetValue(rcCap)}\r\n";
 
             dump += $"\n\t[Video Processor Processor Caps]\r\n";
-            foreach (VideoProcessorProcessorCaps cap in Enum.GetValues(typeof(VideoProcessorProcessorCaps)))
+            foreach (var cap in Enum.GetValues<VideoProcessorProcessorCaps>())
                 dump += $"\t{cap,-35} {(((VideoProcessorProcessorCaps)rcCap.ProcessorCaps & cap) != 0 ? "yes" : "no")}\r\n";
         }
 

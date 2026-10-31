@@ -367,7 +367,7 @@ public class Config : NotifyPropertyChanged
                    config.Player.MinBufferDuration = value;
             }
         }
-        long _BufferDuration = 30 * (long)1000 * 10000;
+        long _BufferDuration = 3 * (long)1000 * 10000; // At least 3 sec. required for weird/delayed interleaved audio with video
 
         /// <summary>
         /// Maximuim allowed packets for buffering (as an extra check along with BufferDuration)
@@ -393,8 +393,8 @@ public class Config : NotifyPropertyChanged
         /// avformat_close_input timeout (ticks) for protocols that support interrupts
         /// </summary>
         public long             CloseTimeout        { get => closeTimeout; set { closeTimeout = value; closeTimeoutMs = value / 10000; } }
-        private long closeTimeout = 1 * 1000 * 10000;
-        internal long closeTimeoutMs = 1 * 1000;
+        private long closeTimeout = 10 * 1000 * 10000;
+        internal long closeTimeoutMs = 10 * 1000;
 
         /// <summary>
         /// avformat_open_input + avformat_find_stream_info timeout (ticks) for protocols that support interrupts (should be related to probesize/analyzeduration)
@@ -407,22 +407,22 @@ public class Config : NotifyPropertyChanged
         /// av_read_frame timeout (ticks) for protocols that support interrupts
         /// </summary>
         public long             ReadTimeout         { get => readTimeout; set { readTimeout = value; readTimeoutMs = value / 10000; } }
-        private long readTimeout = 10 * 1000 * 10000;
-        internal long readTimeoutMs = 10 * 1000;
+        private long readTimeout = 30 * 1000 * 10000;
+        internal long readTimeoutMs = 30 * 1000;
 
         /// <summary>
         /// av_read_frame timeout (ticks) for protocols that support interrupts (for Live streams)
         /// </summary>
         public long             ReadLiveTimeout     { get => readLiveTimeout; set { readLiveTimeout = value; readLiveTimeoutMs = value / 10000; } }
-        private long readLiveTimeout = 20 * 1000 * 10000;
-        internal long readLiveTimeoutMs = 20 * 1000;
+        private long readLiveTimeout = 60 * 1000 * 10000;
+        internal long readLiveTimeoutMs = 60 * 1000;
 
         /// <summary>
         /// av_seek_frame timeout (ticks) for protocols that support interrupts
         /// </summary>
         public long             SeekTimeout         { get => seekTimeout; set { seekTimeout = value; seekTimeoutMs = value / 10000; } }
-        private long seekTimeout = 8 * 1000 * 10000;
-        internal long seekTimeoutMs = 8 * 1000;
+        private long seekTimeout = 30 * 1000 * 10000;
+        internal long seekTimeoutMs = 30 * 1000;
 
         /// <summary>
         /// Forces Input Format
@@ -503,7 +503,7 @@ public class Config : NotifyPropertyChanged
         /// Maximum video frames to be decoded and processed for rendering
         /// </summary>
         public int              MaxVideoFrames      { get => _MaxVideoFrames;   set { if (Set(ref _MaxVideoFrames, value)) { player?.RefreshMaxVideoFrames(); } } }
-        int _MaxVideoFrames = 4;
+        int _MaxVideoFrames = 4; // At least 4 required for smooth playback (can cause audio crackling)
         internal void SetMaxVideoFrames(int maxVideoFrames) { _MaxVideoFrames = maxVideoFrames; RaiseUI(nameof(MaxVideoFrames)); } // can be updated by video decoder if fails to allocate them
 
         /// <summary>
@@ -650,6 +650,30 @@ public class Config : NotifyPropertyChanged
         public int              MaxVerticalResolution       => MaxVerticalResolutionCustom == 0 ? (MaxVerticalResolutionAuto != 0 ? MaxVerticalResolutionAuto : 1080) : MaxVerticalResolutionCustom;
 
         /// <summary>
+        /// Monitor's SDR Minimum Nits (Auto: -1)
+        /// </summary>
+        public float            TargetSDRMinNits            { get => _targetSDRMinNits;    set {  if (Set(ref _targetSDRMinNits, value)) player?.Renderer?.FLUpdateTargetNitsConfig(false); } }
+        float _targetSDRMinNits = -1;
+
+        /// <summary>
+        /// Monitor's SDR Maximum Nits (Auto: -1)
+        /// </summary>
+        public float            TargetSDRPeakNits           { get => _targetSDRPeakNits;    set {  if (Set(ref _targetSDRPeakNits, value)) player?.Renderer?.FLUpdateTargetNitsConfig(false); } }
+        float _targetSDRPeakNits = -1;
+
+        /// <summary>
+        /// Monitor's HDR Minimum Nits (Auto: -1)
+        /// </summary>
+        public float            TargetHDRMinNits            { get => _targetHDRMinNits;    set {  if (Set(ref _targetHDRMinNits, value)) player?.Renderer?.FLUpdateTargetNitsConfig(true); } }
+        float _targetHDRMinNits = -1;
+
+        /// <summary>
+        /// Monitor's HDR Maximum Nits (Auto: -1)
+        /// </summary>
+        public float            TargetHDRPeakNits           { get => _targetHDRPeakNits;    set {  if (Set(ref _targetHDRPeakNits, value)) player?.Renderer?.FLUpdateTargetNitsConfig(true); } }
+        float _targetHDRPeakNits = -1;
+
+        /// <summary>
         /// Sets Super Resolution (Nvidia / Intel - D3D11VP only)
         /// </summary>
         public bool             SuperResolution             { get => _SuperResolution;  set { if (Set(ref _SuperResolution, value)) player?.Renderer?.VPRequest(VPRequestType.Viewport); } }
@@ -685,37 +709,6 @@ public class Config : NotifyPropertyChanged
         /// </summary>
         public bool             DoubleRate                  { get => _DoubleRate;       set => Set(ref _DoubleRate, value); }
         bool _DoubleRate = true;
-
-        /// <summary>
-        /// The HDR to SDR method that will be used by the pixel shader
-        /// </summary>
-        public HDRtoSDRMethod   HDRtoSDRMethod              { get => _HDRtoSDRMethod;   set { if (Set(ref _HDRtoSDRMethod, value))  player?.Renderer?.VPRequest(VPRequestType.HDRtoSDR); } }
-        HDRtoSDRMethod _HDRtoSDRMethod = HDRtoSDRMethod.Hable;
-
-       /// <summary>
-        /// SDR Display Peak Luminance - tonemap for HDR to SDR (based on Auto/Custom)
-        /// </summary>
-        [JsonIgnore]
-        public float SDRDisplayNits
-        {
-            get => SDRDisplayNitsCustom == 0 ? (SDRDisplayNitsAuto != 0 ? SDRDisplayNitsAuto : 200) : SDRDisplayNitsCustom;
-            set => SDRDisplayNitsCustom = value;
-        }
-
-        /// <summary>
-        /// SDR Display Peak Luminance - tonemap for HDR to SDR (Recommended)
-        /// </summary>
-        [JsonIgnore]
-        public float            SDRDisplayNitsAuto          { get => _SDRDisplayNitsAuto;   set { if (Set(ref _SDRDisplayNitsAuto, value) && _SDRDisplayNitsCustom == 0) { player?.Renderer?.VPRequest(VPRequestType.HDRtoSDR); RaiseUI(nameof(SDRDisplayNits)); } } }
-        float _SDRDisplayNitsAuto;
-
-        /// <summary>
-        /// SDR Display Peak Luminance - tonemap for HDR to SDR (Custom)
-        /// </summary>
-        public float            SDRDisplayNitsCustom        { get => _SDRDisplayNitsCustom; set { if (Set(ref _SDRDisplayNitsCustom, value)) { player?.Renderer?.VPRequest(VPRequestType.HDRtoSDR); } } }
-        float _SDRDisplayNitsCustom;
-
-        //public SwapChainFormat  SwapChainFormat             { get; set; } = SwapChainFormat.BGRA;
 
         /// <summary>
         /// Enables custom Direct2D drawing over playback frames
@@ -975,9 +968,9 @@ public class EngineConfig
     /// <summary>
     /// Sets FFmpeg logger's level
     /// </summary>
-    public Flyleaf.FFmpeg.LogLevel
+    public FF.LogLevel
                     FFmpegLogLevel          { get => _FFmpegLogLevel; set { _FFmpegLogLevel = value; if (Engine.IsLoaded) FFmpegEngine.SetLogLevel(); } }
-    Flyleaf.FFmpeg.LogLevel _FFmpegLogLevel = Flyleaf.FFmpeg.LogLevel.Quiet;
+    FF.LogLevel _FFmpegLogLevel = FF.LogLevel.Quiet;
 
     /// <summary>
     /// Whether configuration has been loaded from file

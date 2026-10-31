@@ -145,7 +145,7 @@ public partial class App : Application
         #else
         LogOutput           = ":debug",
         LogLevel            = LogLevel.Debug,
-        FFmpegLogLevel      = Flyleaf.FFmpeg.LogLevel.Warn,
+        FFmpegLogLevel      = Flyleaf.FFmpeg.LogLevel.Warning,
         #endif
     };
 }

@@ -16,6 +16,7 @@ using static FlyleafPlayer.AppConfig;
 using FlyleafLib;
 using FlyleafLib.Controls.WPF;
 using FlyleafLib.MediaPlayer;
+using Flyleaf.FFmpeg;
 
 namespace FlyleafPlayer;
 
@@ -202,7 +203,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (!Engine.Config.Loaded)
         {
             Engine.Config.LogOutput      = null;
-            Engine.Config.LogLevel       = LogLevel.Quiet;
+            Engine.Config.LogLevel       = FlyleafLib.LogLevel.Quiet;
             //Engine.Config.FFmpegDevices  = false;
 
             try { Engine.Config.Save(App.EnginePath); } catch { }
@@ -267,9 +268,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
                 if (e.Player.VideoDemuxer.Name.Contains("webm"))
                 {
-                    if (e.VideoStream.CodecID == Flyleaf.FFmpeg.AVCodecID.Vp8)
+                    if (e.VideoStream.CodecID == AVCodecID.Vp8)
                         e.Player.Config.Decoder.VideoCodec = "libvpx";
-                    else if (e.VideoStream.CodecID == Flyleaf.FFmpeg.AVCodecID.Vp9)
+                    else if (e.VideoStream.CodecID == AVCodecID.Vp9)
                         e.Player.Config.Decoder.VideoCodec = "libvpx-vp9";
                 }
             };
@@ -355,10 +356,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         var opts = Config.DemuxerConfig.DefaultFormatOpt();
 
-        opts["probesize"]       = $"{50L * 1024 * 1024}";
-        opts["analyzeduration"] = $"{TimeSpan.FromSeconds(10).TotalMicroseconds}";
-        opts["extension_picky"] = "0";
-        opts["rtsp_transport"]  = "tcp";
+        opts["probesize"]           = $"{50L * 1024 * 1024}";
+        opts["analyzeduration"]     = $"{TimeSpan.FromSeconds(10).TotalMicroseconds}";
+        opts["extension_picky"]     = "0";
+        opts["rtsp_transport"]      = "tcp";
+
+        // HTTP | Bounded requests (YT throttling) | Update: This seems to be resolved properly with deno.exe
+        //opts["multiple_requests"]   = "1";
+        //opts["request_size"]        = "2097152";
+        //opts["request_size"]        = "8388608";
+
+        // HTTP | Recover premature disconnections (YT external audio)
+        opts["reconnect"]           = "1";
+        //opts["reconnect_on_network_error"] = "1";
+        //opts["reconnect_on_http_error"]    = "500,502,503,504";
+        //opts["reconnect_delay_max"]        = "5";
 
         return opts;
     }

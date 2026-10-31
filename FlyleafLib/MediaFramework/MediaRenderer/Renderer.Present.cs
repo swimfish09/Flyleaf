@@ -20,8 +20,12 @@ public unsafe partial class Renderer
         {
             renderRequestAt = DateTime.UtcNow.Ticks;
 
-            if ((frame != null || forceClear))
+            if (frame != null || forceClear)
+            {
+                if (isPQSpline)
+                    FLHDRDetectReset();
                 Frames.SetRendererFrame(frame);
+            }
 
             if (!SwapChain.CanPresent || !canIdle || isIdleRunning)
                 return;

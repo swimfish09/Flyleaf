@@ -1,6 +1,6 @@
-﻿# *Flyleaf v3.11*: Media Player .NET Library for WinUI 3/WPF/WinForms (based on FFmpeg/DirectX)
+﻿# <img src="Images/Flyleaf_TitleBar_128.png" width="32">*lyleaf v3.11*: Media Player .NET Library
 
-![alt text](Images/Flyleafv3.6.png)
+![alt text](Images/Flyleafv3.11.png)
 
 ---
 
@@ -16,7 +16,7 @@
 - *Extends FFmpeg's supported protocols and formats with additional plugins <sub>(YoutubeDL, TorrentBitSwarm)</sub>*
 - *Accepts Custom I/O Streams and Plugins to handle non-standard protocols / formats*
 	
-✅ **Play it Smoothly** <sub>(Even with high resolutions 4K / HDR)</sub>
+✅ **Play it Smoothly** <sub>(Even with high resolutions 8K / HDR)</sub>
 
 - *Coded from scratch to gain the best possible performance with FFmpeg & DirectX using video acceleration and custom pixel shaders*
 - *Threading implementation with efficient cancellation which allows fast open, play, pause, stop, seek and stream switching*
@@ -33,7 +33,7 @@
 - *HLS Live Seeking <sub>Might the 1st FFmpeg player which does that</sub>*
 - *Pached for [.NET](https://developercommunity.microsoft.com/t/Proper-handling-of-MS_VC_EXCEPTION-0x40/10961029) issues <sub>Use recommended FFmpeg libraries which can be found on GitHub releases</sub>*
 - *Capture Devices <sub>Pass the format, input and options with a single Url eg. fmt://gdigrab?desktop&framerate=30</sub>*
-- *Supports FFmpeg v9.0 <sub>(use updated Flyleaf.FFmpeg.Bindings at your project if required)</sub>*
+- *Supports FFmpeg v9.0 <sub>(use updated Flyleaf.FFmpeg.ABI at your project if required)</sub>*
 
 ### **Playback**
 - *Open / Play / Pause / Stop*
@@ -46,14 +46,15 @@
 - *Device Preference*
 - *Aspect Ratio <sub>(Keep / Fill / Custom)</sub>*
 - *Deinterlace <sub>(Supports double rate, D3D11VP only)</sub>*
-- *HDR to SDR <sub>(Aces / Hable / Reinhard - FlyleafVP only)</sub>*
+- *HDR10 / HDR10+ / HLG / Dolby Vision <sub>(FlyleafVP only)</sub>*
+- *Embedded ICC Profiles*
 - *Pan Move / Zoom / Rotate / HFlip-VFlip / Cropping <sub>~~(Replica Renderer/Interactive Zoom)~~</sub>*
 - *Record / Snapshot*
 - *Super Resolution <sub>(Nvidia / Intel - D3D11VP only)</sub>*
 - *360° Panoramic*
 - *Video Acceleration*
 - *Video Filters <sub>(Brightness / Contrast / Hue / Saturation)</sub>*
-- *Video Processors <sub>(FlyleafVP / D3D11VP)</sub>*
+- *Video Processors <sub>(FlyleafVP / D3D11VP / SwsScale)</sub>*
 - *VSync*
 - *Zero-Copy <sub>(Crops with vertex shader)</sub>*
 - *Split-Frame / Alpha Packing <sub>(Special technique to support alpha with hardware acceleration)</sub>*
@@ -107,7 +108,7 @@
 *Flyleaf wouldn't exist without them!*
 
 * *For the Core*
-  * ***[FFmpeg](http://ffmpeg.org/)*** / ***[Flyleaf.FFmpeg.Bindings](https://github.com/SuRGeoNix/Flyleaf.FFmpeg.Generator)***
+  * ***[FFmpeg](http://ffmpeg.org/)*** / ***[Flyleaf.FFmpeg.ABI](https://github.com/SuRGeoNix/Flyleaf.FFmpeg.ABI)***
   * ***[Vortice](https://github.com/amerkoleci/Vortice.Windows)***
   * *Major open source media players* ***[VLC](https://github.com/videolan/vlc)***, ***[Kodi](https://github.com/xbmc/xbmc)***, ***[MPV](https://github.com/mpv-player/mpv)***, ***[MPC-BE](https://github.com/Aleksoid1978/MPC-BE)***, ***[FFplay](https://github.com/FFmpeg/FFmpeg/blob/master/fftools/ffplay.c)***
 
